@@ -247,16 +247,15 @@ constexpr inline const uint8_t *RoundUp(const uint8_t *pointer) {
 }
 
 uint32_t Extend(uint32_t crc, const char *data, size_t n) {
-
   const uint8_t *p = reinterpret_cast<const uint8_t *>(data);
   const uint8_t *e = p + n;
   uint32_t l = crc ^ kCRC32Xor;
 
 // Process one byte at a time.
-#define STEP1                                                                  \
-  do {                                                                         \
-    int c = (l & 0xff) ^ *p++;                                                 \
-    l = kByteExtensionTable[c] ^ (l >> 8);                                     \
+#define STEP1                              \
+  do {                                     \
+    int c = (l & 0xff) ^ *p++;             \
+    l = kByteExtensionTable[c] ^ (l >> 8); \
   } while (0)
 
 // Process one of the 4 strides of 4-byte data.
@@ -269,23 +268,23 @@ uint32_t Extend(uint32_t crc, const char *data, size_t n) {
   } while (0)
 
 // Process a 16-byte swath of 4 strides, each of which has 4 bytes of data.
-#define STEP16                                                                 \
-  do {                                                                         \
-    STEP4(0);                                                                  \
-    STEP4(1);                                                                  \
-    STEP4(2);                                                                  \
-    STEP4(3);                                                                  \
-    p += 16;                                                                   \
+#define STEP16 \
+  do {         \
+    STEP4(0);  \
+    STEP4(1);  \
+    STEP4(2);  \
+    STEP4(3);  \
+    p += 16;   \
   } while (0)
 
 // Process 4 bytes that were already loaded into a word.
-#define STEP4W(w)                                                              \
-  do {                                                                         \
-    w ^= l;                                                                    \
-    for (size_t i = 0; i < 4; ++i) {                                           \
-      w = (w >> 8) ^ kByteExtensionTable[w & 0xff];                            \
-    }                                                                          \
-    l = w;                                                                     \
+#define STEP4W(w)                                   \
+  do {                                              \
+    w ^= l;                                         \
+    for (size_t i = 0; i < 4; ++i) {                \
+      w = (w >> 8) ^ kByteExtensionTable[w & 0xff]; \
+    }                                               \
+    l = w;                                          \
   } while (0)
 
   // Point x at first 4-byte aligned byte in the buffer. This might be past the

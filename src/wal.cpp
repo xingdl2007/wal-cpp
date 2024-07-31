@@ -2,8 +2,11 @@
 // Created by xdl-2 on 2024/7/27.
 //
 
+#include "wal.h"
+
 #include <fcntl.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <functional>
@@ -13,15 +16,16 @@
 #include "crc32.h"
 #include "slice.h"
 #include "status.h"
-#include "wal.h"
 
 Status PosixError(const std::string &context, int error_number);
 
 class WritableFile {
-public:
+ public:
   WritableFile(std::string filename, int fd)
-      : fd_(fd), is_manifest_(IsManifest(filename)),
-        filename_(std::move(filename)), dirname_(Dirname(filename_)) {}
+      : fd_(fd),
+        is_manifest_(IsManifest(filename)),
+        filename_(std::move(filename)),
+        dirname_(Dirname(filename_)) {}
 
   ~WritableFile() {
     if (fd_ >= 0) {
@@ -68,7 +72,7 @@ public:
       ssize_t write_result = ::write(fd_, data, size);
       if (write_result < 0) {
         if (errno == EINTR) {
-          continue; // Retry
+          continue;  // Retry
         }
         return PosixError(filename_, errno);
       }
@@ -78,7 +82,7 @@ public:
     return Status::OK();
   }
 
-private:
+ private:
   // Ensures that all the caches associated with the given file descriptor's
   // data are flushed all the way to durable media, and can withstand power
   // failures.
@@ -131,9 +135,9 @@ private:
 
   int fd_;
 
-  const bool is_manifest_; // True if the file's name starts with MANIFEST.
+  const bool is_manifest_;  // True if the file's name starts with MANIFEST.
   const std::string filename_;
-  const std::string dirname_; // The directory of filename_.
+  const std::string dirname_;  // The directory of filename_.
 };
 
 Status PosixError(const std::string &context, int error_number) {
@@ -188,21 +192,37 @@ struct LSNode {
   lsn_t end_lsn;
   GrassHopper *owner;
 
-  LSNode *c_next; // for c-list
-  LSNode *c_prev; // for c-list
-  LSNode *gc;
-
-  LSNode *h_next; // for h-list
-  LSNode *h_prev; // for h-list
+  LSNode *next;  // c-list next and gc
 
   LSNode() {
     start_lsn = end_lsn = 0;
     owner = nullptr;
-
-    c_next = c_prev = this;
-    h_next = h_prev = this;
+    next = nullptr;
   }
   ~LSNode() = default;
+};
+
+struct CrawlingList {
+  LSNode *head;
+  LSNode *tail;
+  LSNode *gc;
+
+  CrawlingList() : head(nullptr), tail(nullptr), gc(nullptr) {}
+};
+
+struct HoppingNode {
+  LSNode *lsn_node;
+  HoppingNode *next;
+
+  HoppingNode() : lsn_node(nullptr), next(nullptr) {}
+};
+
+struct HoppingList {
+  HoppingNode *head;
+  HoppingNode *tail;
+  HoppingNode *gc;
+
+  HoppingList() : head(nullptr), tail(nullptr), gc(nullptr) {}
 };
 
 LSNode *MinHeap::Top() {
@@ -224,8 +244,9 @@ void MinHeap::Pop() {
 }
 
 bool MinHeap::Add(LSNode *node) {
+  if (node == nullptr) return false;
   if (map_.find(node->start_lsn) != map_.end()) {
-    return false; // already exists
+    return false;  // already exists
   }
   map_[node->start_lsn] = node;
   heap_.push_back(node->start_lsn);
@@ -238,46 +259,55 @@ bool MinHeap::Add(LSNode *node) {
 bool MinHeap::IsEmpty() { return heap_.empty(); }
 
 struct GrassHopper {
-  LSNode c_list; // crawling list
-  LSNode h_list; // hopping list
+  LSNode *dummy_node_c;  // for easy maintance c_list
+  // HoppingNode *dummy_node_h;  // for easy maintance h_list
+  CrawlingList c_list;  // crawling list
+  // HoppingList h_list;         // hopping list
 
-  GrassHopper *next_;
-  GrassHopper *prev_;
+  GrassHopper *next;
+  GrassHopper *prev;
 
-  GrassHopper() { next_ = prev_ = this; }
-  ~GrassHopper() = default;
+  size_t mask;  // buffer size
+  size_t hopping_distance;
+
+  GrassHopper() {
+    dummy_node_c = new LSNode();
+    c_list.head = c_list.tail = c_list.gc = dummy_node_c;
+    // dummy_node_h = new HoppingNode();
+    // h_list.head = h_list.tail = h_list.gc = dummy_node_h;
+    next = prev = this;
+  }
+  ~GrassHopper() {
+    CleanUp();
+    free(c_list.gc);  // last one, maybe dummy node
+  }
 
   // add to tail of c-list and h-list
-  void AddNodeToTail(LSNode *node, size_t mask) {
-    auto *pre_tail = c_list.c_prev;
+  void AddNodeToTail(LSNode *node) {
     bool add_h_list = false;
-    if (pre_tail == &c_list ||
-        (pre_tail->start_lsn & mask) != (node->start_lsn & mask)) {
-      add_h_list = true;
-    }
-
     // add to crawling list tail
-    node->c_next = &c_list; // node as new tail
-    node->c_prev = pre_tail;
-    pre_tail->c_next = node;
-    c_list.c_prev = node;
+    c_list.tail->next = node;
+    c_list.tail = node;
 
-    // add to hopping list tail
-    if (add_h_list) {
-      auto *h_pre_tail = h_list.h_prev;
-      node->h_next = &h_list;
-      node->h_prev = h_pre_tail;
-      h_pre_tail->h_next = node;
-      h_list.h_prev = node;
+    // TODO(xdliang): h-list
+  }
+
+  // only touch head pointer
+  void AdvanceCList(lsn_t end_lsn) {
+    while (c_list.head->end_lsn < end_lsn && c_list.head != c_list.tail) {
+      c_list.head = c_list.head->next;
+      assert(c_list.head);
     }
   }
 
-  void AdvanceCList(LSNode *node) {}
-
-  void AdvanceHList(lsn_t end_lsn) {}
-
   // deallocate durable LSNode
-  void CleanUp() {}
+  void CleanUp() {
+    while (c_list.gc != c_list.head) {
+      auto *node = c_list.gc;
+      c_list.gc = node->next;
+      free(node);
+    }
+  }
 };
 
 // list of all grasshoppers
@@ -285,19 +315,21 @@ std::mutex grasshopper_lock;
 GrassHopper dummy_grasshopper;
 __thread GrassHopper *per_thead_grasshopper;
 
-GrassHopper *GetPerThreadGrassHopper() {
+GrassHopper *GetPerThreadGrassHopper(size_t mask, size_t h) {
   if (per_thead_grasshopper == nullptr) {
     per_thead_grasshopper = new GrassHopper();
+    per_thead_grasshopper->mask = mask;
+    per_thead_grasshopper->hopping_distance = h;
     if (per_thead_grasshopper == nullptr) {
       std::cerr << "GetGrassHopper: malloc failed";
       abort();
     } else {
       std::lock_guard<std::mutex> lock(grasshopper_lock);
-      per_thead_grasshopper->next_ = dummy_grasshopper.next_;
-      per_thead_grasshopper->prev_ = dummy_grasshopper.next_->prev_;
+      per_thead_grasshopper->next = dummy_grasshopper.next;
+      per_thead_grasshopper->prev = dummy_grasshopper.next->prev;
 
-      dummy_grasshopper.next_->prev_ = per_thead_grasshopper;
-      dummy_grasshopper.next_ = per_thead_grasshopper;
+      dummy_grasshopper.next->prev = per_thead_grasshopper;
+      dummy_grasshopper.next = per_thead_grasshopper;
     }
   }
   return per_thead_grasshopper;
@@ -306,12 +338,15 @@ GrassHopper *GetPerThreadGrassHopper() {
 WALManager::WALManager() : WALManager(Option::DefaultOption()) {}
 
 WALManager::WALManager(const Option &option)
-    : option_(option), log_buffer_size_(option_.log_buffer_size),
+    : option_(option),
+      quit_(false),
+      log_buffer_size_(option_.log_buffer_size),
       log_buffer_mask_(log_buffer_size_ - 1),
       hopping_distance_(option_.page_size),
-      index_table_size_(option_.log_buffer_size / option_.page_size), lsn_(0),
-      sbl_(0), sdl_(0) {
-
+      index_table_size_(option_.log_buffer_size / option_.page_size),
+      lsn_(0),
+      sbl_(std::numeric_limits<lsn_t>::max()),
+      sdl_(0) {
   // log buffer size must be power of 2
   assert((log_buffer_size_ & (log_buffer_size_ - 1)) == 0);
   log_buffer_ = (char *)malloc(log_buffer_size_);
@@ -327,7 +362,7 @@ WALManager::WALManager(const Option &option)
     abort();
   }
 
-  // The following should really be part of Recover
+  // The following should be part of Recover
   worker_thread_ = std::thread(std::bind(&WALManager::TrackLSN, this));
   flush_thread_ = std::thread(std::bind(&WALManager::FlushLog, this));
 
@@ -339,15 +374,22 @@ WALManager::WALManager(const Option &option)
     abort();
   }
 
-  s = NewWritableFile(LogFilename(option_.db_path, sdl_), &logfile_);
+  log_filename_ = LogFilename(option_.db_path, 0);
+  s = NewWritableFile(log_filename_, &logfile_);
   if (!s.ok()) {
     std::cerr << "WALManager ctor: new log file failed, err msg: "
               << s.ToString() << std::endl;
     abort();
   }
+
+  char buffer[256];
+  size_t written = sprintf(buffer, "%s:%ld\n", log_filename_.c_str(), 0l);
+  manifest_file_->Write(buffer, written);
+  manifest_file_->SyncDirIfManifest();
 }
 
 WALManager::~WALManager() {
+  quit_ = true;
   delete h_index_;
   delete log_buffer_;
   if (worker_thread_.joinable()) {
@@ -423,7 +465,7 @@ void WALManager::UpdateHIndex(LSNode *node, uint32_t size) {
       h_index_[i] += option_.page_size;
       size -= option_.page_size;
     }
-    h_index_[i] += size; // left
+    h_index_[i] += size;  // left
   }
 }
 
@@ -431,7 +473,7 @@ void WALManager::UpdateHIndex(LSNode *node, uint32_t size) {
 bool WALManager::Write(const LogRecord &record, lsn_t *lsn) {
   uint32_t crc32 = Value(record.entry, record.len);
   const size_t size =
-      sizeof(uint32_t) + record.len + sizeof(uint32_t); // for CRC32
+      sizeof(uint32_t) + record.len + sizeof(uint32_t);  // for CRC32
   LSNode *node = new LSNode();
   if (!node) {
     std::cerr << "Write: allocate LSNode failed" << std::endl;
@@ -446,7 +488,8 @@ bool WALManager::Write(const LogRecord &record, lsn_t *lsn) {
   // fast path to detect sbl
   UpdateHIndex(node, size);
 
-  GrassHopper *grassHopper = GetPerThreadGrassHopper();
+  GrassHopper *grassHopper =
+      GetPerThreadGrassHopper(option_.log_buffer_size - 1, option_.page_size);
   assert(grassHopper);
   node->owner = grassHopper;
 
@@ -456,7 +499,7 @@ bool WALManager::Write(const LogRecord &record, lsn_t *lsn) {
   const auto end_lsn = node->end_lsn;
 
   // add node to c-list and h-list
-  grassHopper->AddNodeToTail(node, option_.page_size - 1);
+  grassHopper->AddNodeToTail(node);
 
   // busy waiting, and do not touch node anymore
   while (sdl_.load(std::memory_order_relaxed) < end_lsn) {
@@ -468,38 +511,75 @@ bool WALManager::Write(const LogRecord &record, lsn_t *lsn) {
 lsn_t WALManager::Recovery() { return 0; }
 
 void WALManager::TrackLSN() {
-  while (true) {
+  while (!quit_) {
     auto lsn = lsn_.load();
     auto sbl = sbl_.load();
     if (lsn - sbl >= option_.page_size) {
       // sbl lagging too much, hopping
       auto i = (sbl & log_buffer_mask_) / option_.page_size;
       if (h_index_[i] == option_.page_size) {
-        h_index_[i] = 0;          // reset to zero
-        sbl += option_.page_size; // notify flush thread to flush
-
-        for (auto *p = dummy_grasshopper.next_;
-             p != nullptr && p != &dummy_grasshopper; p = p->next_) {
-          p->AdvanceHList(sbl);
+        h_index_[i] = 0;  // reset to zero
+        sbl = (sbl & ~(option_.page_size - 1)) +
+              option_.page_size;  // notify flush thread to flush
+        sbl_.store(sbl);          // advancing sbl
+        for (auto *p = dummy_grasshopper.next;
+             p != nullptr && p != &dummy_grasshopper; p = p->next) {
+          p->AdvanceCList(sbl);
         }
         continue;
       }
     }
 
-    // otherwise, crawling
-    // build LSN mini-heap
-    for (auto *p = dummy_grasshopper.next_;
-         p != nullptr && p != &dummy_grasshopper; p = p->next_) {
-      min_heap_.Add(p->c_list.c_next); // head
+    // otherwise, crawling, build LSN mini-heap
+    for (auto *p = dummy_grasshopper.next;
+         p != nullptr && p != &dummy_grasshopper; p = p->next) {
+      min_heap_.Add(p->c_list.head->next);  // head->next
     }
 
     // trace LSN hole, update if LSN is sequential
     auto *node = min_heap_.Top();
-    if (node->start_lsn == sbl) {
-      sbl_.store(node->end_lsn); // advancing sbl
-      node->owner->AdvanceCList(node);
+    if (node != nullptr && node->start_lsn == sbl + 1) {
+      sbl_.store(node->end_lsn);                      // advancing sbl
+      node->owner->AdvanceCList(node->end_lsn);       // pop
+      min_heap_.Add(node->owner->c_list.head->next);  // add new node
     }
   }
 }
 
-void WALManager::FlushLog() {}
+void WALManager::FlushLog() {
+  do {
+    auto sbl = sbl_.load();
+    auto sdl = sdl_.load();
+    if (sbl != std::numeric_limits<lsn_t>::max() && sbl > sdl) {
+      char *buffer = log_buffer_ + (sbl & log_buffer_mask_);
+      size_t size = sbl - sdl;
+      uint32_t remaining = log_buffer_size_ - (sbl & log_buffer_mask_);
+
+      if (size <= remaining) {
+        logfile_->Write(buffer, size);
+        logfile_->Sync();
+      } else {
+        logfile_->Write(buffer, remaining);
+        logfile_->Sync();
+        delete logfile_;
+
+        // switch new log file and record first record offset to mainifest file
+        log_filename_ = LogFilename(option_.db_path, sdl_);
+        Status s = NewWritableFile(log_filename_, &logfile_);
+        if (!s.ok()) {
+          std::cerr << "WALManager FlushLog: new log file failed, err msg: "
+                    << s.ToString() << std::endl;
+          abort();
+        }
+        logfile_->Write(log_buffer_, size - remaining);
+        logfile_->Sync();
+
+        char buffer[256];
+        size_t written = sprintf(buffer, "%s:%ld\n", log_filename_.c_str(),
+                                 size - remaining);
+        manifest_file_->Write(buffer, written);
+        manifest_file_->Sync();
+      }
+    }
+  } while (!quit_);
+}

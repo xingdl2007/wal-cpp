@@ -7,7 +7,7 @@
 #include "slice.h"
 
 class Status {
-public:
+ public:
   // Create a success status.
   Status() noexcept : state_(nullptr) {}
   ~Status() { delete[] state_; }
@@ -60,7 +60,7 @@ public:
   // Returns the string "OK" for success.
   std::string ToString() const;
 
-private:
+ private:
   enum Code {
     kOk = 0,
     kNotFound = 1,

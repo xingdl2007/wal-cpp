@@ -26,4 +26,4 @@ target_sources(wal PRIVATE
 )
 
 add_executable(wal-cpp "main.cpp" "util.h")
-target_link_libraries(wal-cpp wal)
+target_link_libraries(wal-cpp wal pthread)

@@ -4,21 +4,20 @@
 
 #pragma once
 
+#include <error.h>
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <cassert>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
-#include <error.h>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
-
-#include <atomic>
-#include <cassert>
-#include <string>
 
 using lsn_t = uint64_t;
 
@@ -30,9 +29,9 @@ struct LogRecord {
 struct Option {
   static Option DefaultOption() {
     struct Option opt;
-    opt.db_path = ".";                       // current directory
-    opt.log_buffer_size = 256 * 1024 * 1024; // 256MB
-    opt.page_size = 4 * 1024;                // 4KB
+    opt.db_path = ".";                        // current directory
+    opt.log_buffer_size = 256 * 1024 * 1024;  // 256MB
+    opt.page_size = 4 * 1024;                 // 4KB
     return opt;
   }
 
@@ -50,7 +49,7 @@ class LSNode;
 class WritableFile;
 
 class MinHeap {
-public:
+ public:
   MinHeap() = default;
   ~MinHeap() = default;
 
@@ -60,13 +59,13 @@ public:
   bool Add(LSNode *);
   bool IsEmpty();
 
-private:
+ private:
   std::unordered_map<lsn_t, LSNode *> map_;
   std::deque<lsn_t> heap_;
 };
 
 class WALManager {
-public:
+ public:
   WALManager();
   explicit WALManager(const Option &opt);
   virtual ~WALManager();
@@ -75,18 +74,19 @@ public:
 
   lsn_t Recovery();
 
-private:
+ private:
   void TrackLSN();
   void FlushLog();
 
   void CopyPayload(LSNode *, const LogRecord &record, uint32_t, uint32_t);
   void UpdateHIndex(LSNode *, uint32_t);
 
-private:
+ private:
   Option option_;
 
-  std::thread worker_thread_; // track lsn
-  std::thread flush_thread_;  // flush log to disk
+  volatile bool quit_;
+  std::thread worker_thread_;  // track lsn
+  std::thread flush_thread_;   // flush log to disk
 
   // in-memory log buffer
   char *log_buffer_;
@@ -111,7 +111,7 @@ private:
 
   MinHeap min_heap_;
 
-  std::atomic<lsn_t> lsn_; // log sequence number
-  std::atomic<lsn_t> sbl_; // sequentially buffered log
-  std::atomic<lsn_t> sdl_; // storage durable log
+  std::atomic<lsn_t> lsn_;  // log sequence number
+  std::atomic<lsn_t> sbl_;  // sequentially buffered log
+  std::atomic<lsn_t> sdl_;  // storage durable log
 };
